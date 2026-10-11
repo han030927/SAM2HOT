@@ -59,8 +59,6 @@ Set `training.data_root` and `training.score_root` in the config, then run:
 python train_motion.py --config configs/hot20.yaml
 ```
 
-Only the motion MLP is trained, using Smooth L1 center loss. HOTC2020 sequence
-identities are excluded before a modality-stratified 90%/10% train/validation split.
 The best checkpoint is saved to `checkpoints/motion_l5_o3/best.pth`; set
 `motion_checkpoint` in the config to this path to evaluate a newly trained model.
 
