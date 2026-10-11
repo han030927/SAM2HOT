@@ -1,0 +1,38 @@
+# The only experiment profile: HOTC2020 VIS, DAM4SAM + TABR + SDMR.
+# Relative paths below are resolved from the repository root.
+data_root: data/HOTC2020/test
+output_root: outputs/hot20
+device: cuda:0
+seed: 0
+backbone_checkpoint: weights/sam2.1_hiera_large.pt
+backbone_config: sam21pp_hiera_l.yaml
+motion_checkpoint: weights/motion_image_norm_l5_o3.pth
+
+tabr:
+  topk: 0.9
+  lambda: 0.6
+  eta: 0.7
+  temperature: 1.0
+  wavelength_sigma: 3.0
+
+sdmr:
+  object_threshold: 0.9
+  ema_alpha: 0.2
+
+# Optional offline training from exported HOTC2023 DAM4SAM trajectories.
+# Inference does not need these datasets or exports.
+training:
+  data_root: data/HOTC2023/training
+  score_root: data/dam4sam_hot23_training_score
+  output_dir: checkpoints/motion_l5_o3
+  epochs: 40
+  batch_size: 128
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  samples_per_epoch: 5000
+  val_samples: 2000
+  val_ratio: 0.1
+  seed: 123
+  score_floor: 0.10
+  warmup_epochs: 1
+  min_lr_ratio: 0.05

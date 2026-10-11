@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+weights/*.pt
+weights/*.pth
+!weights/motion_image_norm_l5_o3.pth
+checkpoints/
+outputs/
+data/
+*.egg-info/
