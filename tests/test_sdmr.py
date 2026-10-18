@@ -1,4 +1,4 @@
-"""CPU-only tests, including optional exact comparison to the original project.
+"""CPU-only SDMR regression tests.
 
 Run: python -m unittest discover -s tests -p test_sdmr.py -v
 
@@ -77,23 +77,88 @@ class SDMRTests(unittest.TestCase):
 
     def test_gate_boundary_size_update_and_raw_history(self):
         runtime = SDMR(make_loaded(), [10, 10, 20, 20], 200, 100)
-        # Supply an exact prior to isolate gate and scale semantics from weights.
         runtime._predict = lambda: {"center_px": np.asarray([100., 50.])}
         raw = np.asarray([15., 10., 24., 24.])
-        final, debug = runtime.step(raw, .9, .75, False)
+        final, debug = runtime.step(raw, .90000001, .1, False)
         np.testing.assert_array_equal(final, raw)
         self.assertFalse(debug["scheduled"])
         self.assertTrue(debug["size_updated"])
-        expected = np.exp(.8 * np.log(20.) + .2 * np.log(24.))
+        expected = .8 * 20. + .2 * 24.
         np.testing.assert_array_equal(debug["stable_size"], [expected, expected])
-        raw = np.asarray([16., 10., 24., 24.])
-        final, debug = runtime.step(raw, .89999999, .75, False)
+        raw = np.asarray([16., 10., 28., 28.])
+        final, debug = runtime.step(raw, .9, 1., False)
         self.assertTrue(debug["applied"])
+        self.assertFalse(debug["size_updated"])
+        np.testing.assert_array_equal(debug["stable_size"], [expected, expected])
         np.testing.assert_array_equal(runtime.history[-1], runtime._normalise(raw))
         self.assertNotEqual(float(final[0]), float(raw[0]))
-        previous = runtime.log_size.copy()
-        runtime.step([16., 10., 100., 100.], .99, .99, False)
-        np.testing.assert_array_equal(runtime.log_size, previous)  # Ratio rejection.
+        previous = runtime.size.copy()
+        _, debug = runtime.step([16., 10., 100., 100.], .99, 0., False)
+        self.assertTrue(debug["size_updated"])
+        np.testing.assert_array_equal(runtime.size, .8 * previous + .2 * np.asarray([100., 100.]))
+
+    def test_linear_size_ema_on_both_axes_and_recovery(self):
+        initial = np.asarray([10., 10., 20., 40.])
+        runtime = SDMR(make_loaded(), initial, 200, 200, ema_alpha=.2)
+        runtime._predict = lambda: {"center_px": np.asarray([100., 100.])}
+        initial[2:] = 1.
+        expected = np.asarray([20., 40.])
+        for width, height in ((24., 32.), (22., 45.), (18., 36.)):
+            expected = .8 * expected + .2 * np.asarray([width, height])
+            raw = np.asarray([15., 10., width, height])
+            final, debug = runtime.step(raw, .95, .9, False)
+            self.assertTrue(debug["size_updated"])
+            self.assertFalse(debug["applied"])
+            np.testing.assert_array_equal(final, raw)
+            final, debug = runtime.step([15., 10., width * 2, height * 2], .8, .9, False)
+            self.assertFalse(debug["size_updated"])
+            self.assertTrue(debug["applied"])
+            np.testing.assert_array_equal(debug["stable_size"], expected)
+            np.testing.assert_allclose(final[2:], expected, rtol=0, atol=1e-13)
+            np.testing.assert_allclose(final[:2] + .5 * final[2:], [100., 100.], rtol=0, atol=1e-13)
+        geometric = np.asarray([20., 40.])
+        for observed in ([24., 32.], [22., 45.], [18., 36.]):
+            geometric = np.exp(.8 * np.log(geometric) + .2 * np.log(observed))
+        self.assertTrue(np.all(np.abs(runtime.size - geometric) > .01))
+
+    def test_size_ema_freezes_on_each_failed_reliability_check(self):
+        cases = (
+            ([15., 10., 24., 32.], .899999, .9, False),
+            ([15., 10., 24., 32.], .9, .9, False),
+            ([15., 10., 24., 32.], .99, .9, True),
+            ([15., 10., 0., 32.], .99, .9, False),
+            ([15., 10., 24., -1.], .99, .9, False),
+        )
+        for raw, object_score, sam_iou, empty in cases:
+            with self.subTest(raw=raw, object_score=object_score, sam_iou=sam_iou, empty=empty):
+                runtime = SDMR(make_loaded(), [10., 10., 20., 40.], 200, 200)
+                runtime._predict = lambda: {"center_px": np.asarray([100., 100.])}
+                _, debug = runtime.step(raw, object_score, sam_iou, empty)
+                self.assertFalse(debug["size_updated"])
+                self.assertTrue(debug["applied"])
+                np.testing.assert_array_equal(runtime.size, [20., 40.])
+
+    def test_size_ema_alpha_one_uses_current_reliable_size(self):
+        runtime = SDMR(make_loaded(), [10., 10., 20., 40.], 200, 200, ema_alpha=1.)
+        _, debug = runtime.step([15., 10., 24., 32.], .95, .75, False)
+        self.assertTrue(debug["size_updated"])
+        np.testing.assert_array_equal(runtime.size, [24., 32.])
+
+    def test_size_ema_alpha_zero_keeps_initial_size(self):
+        runtime = SDMR(make_loaded(), [10., 10., 20., 40.], 200, 200, ema_alpha=0.)
+        runtime.step([15., 10., 24., 32.], .95, .9, False)
+        np.testing.assert_array_equal(runtime.size, [20., 40.])
+
+    def test_object_threshold_endpoints(self):
+        for threshold, object_score, reliable in ((0., 0., False), (0., .01, True),
+                                                  (1., 1., False)):
+            with self.subTest(threshold=threshold, object_score=object_score):
+                runtime = SDMR(make_loaded(), [10., 10., 20., 40.], 200, 200,
+                               object_threshold=threshold)
+                runtime._predict = lambda: {"center_px": np.asarray([100., 100.])}
+                _, debug = runtime.step([15., 10., 24., 32.], object_score, .9, False)
+                self.assertEqual(debug["size_updated"], reliable)
+                self.assertEqual(debug["applied"], not reliable)
 
     def test_clipping_and_invalid_prior_fall_back_to_raw(self):
         np.testing.assert_array_equal(clip_box([-5, -4, 10, 8], 100, 50), [0, 0, 5, 4])
@@ -140,6 +205,25 @@ def load_reference(path, name):
 _REFERENCE_VARIABLES = ("SAM2HOT_REFERENCE_PROJECT", "SAM2HOT_REFERENCE_RUNTIME", "SAM2HOT_REFERENCE_CORE")
 
 
+def reference_linear_sizes(raw, rows, alpha, threshold):
+    """Independent scalar implementation of gated linear width/height EMA."""
+    sizes = np.zeros((len(raw), 2), dtype=np.float64)
+    updated = np.zeros(len(raw), dtype=bool)
+    width, height = (max(float(value), 1e-6) for value in raw[0, 2:4])
+    sizes[0] = [width, height]
+    for index in range(1, len(raw)):
+        row, box = rows[index], raw[index]
+        valid = np.isfinite(box).all() and box[2] > 0 and box[3] > 0
+        reliable = (valid and not row["mask_empty"]
+                    and row["object_prob"] > threshold)
+        if reliable:
+            width = (1 - alpha) * width + alpha * max(float(box[2]), 1e-6)
+            height = (1 - alpha) * height + alpha * max(float(box[3]), 1e-6)
+            updated[index] = True
+        sizes[index] = [width, height]
+    return sizes, updated
+
+
 @unittest.skipUnless(all(os.environ.get(name) for name in _REFERENCE_VARIABLES),
                      "Optional original-project references not configured")
 class OriginalParityTests(unittest.TestCase):
@@ -167,7 +251,7 @@ class OriginalParityTests(unittest.TestCase):
         for key, value in clean.items():
             torch.testing.assert_close(value, original[key], rtol=0, atol=0, msg=key)
 
-    def test_all_35_observation_sequences_exactly_match_original(self):
+    def test_all_35_sequences_match_original_centers_and_linear_size_reference(self):
         total_frames = 0
         for name in self.runtime.HOT20_SEQUENCES:
             with self.subTest(sequence=name):
@@ -179,8 +263,16 @@ class OriginalParityTests(unittest.TestCase):
                 width, height = float(csv_rows[0]["image_width"]), float(csv_rows[0]["image_height"])
                 sequence = SimpleNamespace(raw=raw, gt=raw, rows=rows, image_width=width, image_height=height)
                 centers, ready, _ = self.runtime.replay_sequence(sequence, self.original, self.core)
-                sizes, size_updated = self.core.stable_sizes(sequence, .2)
-                expected, applied = self.core.final_predictions(sequence, centers, ready, sizes, .9, False)
+                sizes, size_updated = reference_linear_sizes(raw, rows, .2, .9)
+                expected = raw.copy()
+                applied = np.zeros(len(raw), dtype=bool)
+                for index in range(1, len(raw)):
+                    if not ready[index] or size_updated[index] or not np.isfinite(centers[index]).all():
+                        continue
+                    candidate = self.core.center_size_box(centers[index], sizes[index])
+                    candidate = self.core.clip_box(candidate, width, height)
+                    if self.core.valid_box(candidate):
+                        expected[index], applied[index] = candidate, True
                 fresh = SDMR(self.clean, raw[0], width, height)
                 output = [fresh.initial_bbox]
                 for index in range(1, len(raw)):

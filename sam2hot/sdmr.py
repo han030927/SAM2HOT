@@ -1,10 +1,4 @@
-"""Streaming SDMR with exact parity to the selected V2 offline recovery.
-
-Initialize once from frame-zero GT. Call ``step`` only for frames 1 onward.
-The caller supplies raw boxes rounded to six decimals and probabilities/SAM
-IoUs rounded to eight decimals, matching the original observation CSV boundary.
-Recovered boxes never enter the tracker's memory or this module's history.
-"""
+"""Streaming SAM2-aligned decoupled motion recovery."""
 from __future__ import annotations
 
 import numpy as np
@@ -33,12 +27,7 @@ def clip_box(box, width: float, height: float) -> np.ndarray:
 
 
 class SDMR:
-    """Output-only center recovery plus reliability-gated log-size EMA.
-
-    ``initial_bbox`` is frame-zero XYWH in original-image pixels; it is also
-    the unchanged first output. ``step`` returns ``(final_xywh, debug)``.
-    ``object_score`` means sigmoid object probability, never the raw logit.
-    """
+    """Output-only center recovery and reliability-gated width/height EMA."""
 
     def __init__(self, loaded: LoadedMotion, initial_bbox, image_width: float,
                  image_height: float, *, object_threshold: float = 0.9,
@@ -47,7 +36,7 @@ class SDMR:
             raise ValueError("Frame-zero initialization must be a valid XYWH box")
         if not np.isfinite(image_width) or not np.isfinite(image_height) or min(image_width, image_height) <= 0:
             raise ValueError("Image dimensions must be finite and positive")
-        if not 0.0 <= object_threshold <= 1.0 or not 0.0 < ema_alpha <= 1.0:
+        if not 0.0 <= object_threshold <= 1.0 or not 0.0 <= ema_alpha <= 1.0:
             raise ValueError("Invalid object threshold or EMA alpha")
         self.loaded = loaded
         self.initial_bbox = np.asarray(initial_bbox, dtype=np.float64).reshape(-1)[:4].copy()
@@ -58,7 +47,7 @@ class SDMR:
         self.valid: list[float] = []
         self.last_valid: np.ndarray | None = None
         self.frame_index = 0
-        self.log_size = np.log(np.maximum(np.asarray(self.initial_bbox[2:4], dtype=float), 1e-6))
+        self.size = np.maximum(self.initial_bbox[2:4], 1e-6).copy()
         self._append(self.initial_bbox, 1.0, True)
 
     def _normalise(self, box) -> np.ndarray | None:
@@ -90,7 +79,6 @@ class SDMR:
         boxes = np.stack(self.history[-length:], axis=0)
         scores = np.asarray(self.scores[-length:], dtype=np.float32)[:, None]
         valid = np.asarray(self.valid[-length:], dtype=np.float32)[:, None]
-        # The original SDMR runtime runs float32, independently of tracker AMP.
         with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
             output = self.loaded.model(
                 torch.as_tensor(boxes, device=device).unsqueeze(0),
@@ -118,19 +106,14 @@ class SDMR:
         if not np.isfinite(object_score) or not np.isfinite(sam_iou):
             raise ValueError("Observation scores must be finite")
         self.frame_index += 1
-        prediction = self._predict()  # Never include frame t in its own prediction.
-        current = np.exp(self.log_size)
-        ratios = np.asarray([np.nan, np.nan])
-        if valid_box(raw):
-            ratios = np.asarray(raw[2:4], dtype=float) / np.maximum(current, 1e-6)
-        score_gate = bool(valid_box(raw) and not mask_empty and object_score >= 0.70 and sam_iou >= 0.75)
-        size_gate = bool(np.all((ratios >= 0.75) & (ratios <= 1.33)))
-        size_updated = score_gate and size_gate
+        prediction = self._predict()
+        reliable = bool(valid_box(raw) and not mask_empty and object_score > self.object_threshold)
+        size_updated = reliable
         if size_updated:
-            self.log_size = ((1.0 - self.ema_alpha) * self.log_size
-                             + self.ema_alpha * np.log(np.maximum(raw[2:4], 1e-6)))
-        stable_size = np.exp(self.log_size)
-        scheduled = bool(prediction is not None and (mask_empty or object_score < self.object_threshold))
+            self.size = ((1.0 - self.ema_alpha) * self.size
+                         + self.ema_alpha * np.maximum(raw[2:4], 1e-6))
+        stable_size = self.size
+        scheduled = bool(prediction is not None and not reliable)
         final, applied = raw.copy(), False
         if scheduled and np.all(np.isfinite(prediction["center_px"])):
             cx, cy = [float(value) for value in prediction["center_px"]]
